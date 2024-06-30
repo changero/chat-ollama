@@ -1,32 +1,53 @@
-const KEYS = [
-  'x_openai_api_key',
-  'x_openai_api_host',
+import { tryParseJson } from '~/composables/utils'
 
-  'x_azure_openai_api_key',
-  'x_azure_openai_endpoint',
-  'x_azure_openai_deployment_name',
-
-  'x_anthropic_api_key',
-  'x_anthropic_api_host',
-
-  'x_moonshot_api_key',
-  'x_moonshot_api_host',
-
-  'x_gemini_api_key',
-
-  'x_groq_api_key',
-  'x_groq_api_host',
-] as const
-
-export type KEYS = typeof KEYS[number]
+export interface ContextKeys {
+  ollama: {
+    endpoint: string
+    username: string
+    password: string
+  },
+  openai: {
+    key: string
+    endpoint: string
+    proxy: boolean
+  },
+  azureOpenai: {
+    key: string
+    endpoint: string
+    deploymentName: string
+    proxy: boolean
+  },
+  anthropic: {
+    key: string
+    endpoint: string
+    proxy: boolean
+  },
+  moonshot: {
+    key: string
+    endpoint: string
+  },
+  gemini: {
+    key: string
+    endpoint: string
+    proxy: boolean
+  },
+  groq: {
+    key: string
+    endpoint: string
+    proxy: boolean
+  }
+}
 
 export default defineEventHandler((event) => {
   const headers = getRequestHeaders(event)
-  const keys: { [key: string]: any } = {}
+  const value = headers['x-chat-ollama-keys']
+  const data = (value ? tryParseJson(value, {}) : {}) as ContextKeys
 
-  for (const key of KEYS) {
-    keys[key] = headers[key]
+  event.context.keys = {
+    ...data,
+    ollama: {
+      ...data.ollama,
+      endpoint: (data.ollama?.endpoint || 'http://127.0.0.1:11434').replace(/\/$/, ''),
+    }
   }
-
-  event.context.keys = keys
 })

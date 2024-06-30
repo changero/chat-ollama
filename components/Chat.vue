@@ -1,22 +1,11 @@
 <script setup lang="ts">
-import { useMutationObserver, useThrottleFn } from '@vueuse/core'
+import { useMutationObserver, useThrottleFn, useScroll } from '@vueuse/core'
 import type { KnowledgeBase } from '@prisma/client'
-import { fetchHeadersOllama, fetchHeadersThirdApi, loadOllamaInstructions, loadKnowledgeBases } from '@/utils/settings'
+import { loadOllamaInstructions, loadKnowledgeBases } from '@/utils/settings'
 import { type ChatBoxFormData } from '@/components/ChatInputBox.vue'
 import { type ChatSessionSettings } from '~/pages/chat/index.vue'
 import { ChatSettings } from '#components'
-
-type RelevantDocument = Required<ChatHistory>['relevantDocs'][number]
-type ResponseRelevantDocument = { type: 'relevant_documents', relevant_documents: RelevantDocument[] }
-
-export interface Message {
-  id?: number
-  role: 'system' | 'assistant' | 'user'
-  content: string
-  type?: 'loading' | 'canceled'
-  timestamp: number
-  relevantDocs?: RelevantDocument[]
-}
+import type { ChatMessage } from '~/types/chat'
 
 type Instruction = Awaited<ReturnType<typeof loadOllamaInstructions>>[number]
 
@@ -25,27 +14,48 @@ const props = defineProps<{
 }>()
 
 const emits = defineEmits<{
-  // remove a message if it's null
-  message: [data: Message | null]
+  // it means remove a message if `data` is null
+  message: [data: ChatMessage | null]
   changeSettings: [data: ChatSessionSettings]
 }>()
 
-const markdown = useMarkdown()
+const { t } = useI18n()
+const { chatModels } = useModels()
 const modal = useModal()
+const { onReceivedMessage, sendMessage } = useChatWorker()
+
 const sessionInfo = ref<ChatSession>()
 const knowledgeBases: KnowledgeBase[] = []
 const knowledgeBaseInfo = ref<KnowledgeBase>()
 const instructions: Instruction[] = []
 const instructionInfo = ref<Instruction>()
 const chatInputBoxRef = shallowRef()
-const model = ref('')
-const modelFamily = ref('')
-const messages = ref<Message[]>([])
-const sending = ref(false)
-let abortHandler: (() => void) | null = null
-const limitHistorySize = 20
+/** `['family:model']` */
+const models = ref<string[]>([])
+const messages = ref<ChatMessage[]>([])
+const sendingCount = ref(0)
 const messageListEl = shallowRef<HTMLElement>()
-let isScrollSmooth = false
+const behavior = ref<ScrollBehavior>('auto')
+const { y } = useScroll(messageListEl, { behavior })
+const isFirstLoad = ref(true)
+const limitHistorySize = computed(() => Math.max(sessionInfo.value?.attachedMessagesCount || 0, 20))
+
+const isUserScrolling = computed(() => {
+  if (isFirstLoad.value) return false
+
+  if (messageListEl.value) {
+    const bottomOffset = messageListEl.value.scrollHeight - messageListEl.value.clientHeight
+    if (bottomOffset - y.value < 120) {
+      return false
+    }
+  }
+  return true
+})
+
+const scrollToBottom = (_behavior: ScrollBehavior) => {
+  behavior.value = _behavior
+  y.value = messageListEl.value!.scrollHeight
+}
 
 const visibleMessages = computed(() => {
   return messages.value.filter((message) => message.role !== 'system')
@@ -53,6 +63,8 @@ const visibleMessages = computed(() => {
 
 watch(() => props.sessionId, async id => {
   if (id) {
+    isFirstLoad.value = true
+    sendingCount.value = 0
     initData(id)
   }
 })
@@ -61,23 +73,23 @@ useMutationObserver(messageListEl, useThrottleFn((e: MutationRecord[]) => {
   if (e.some(el => (el.target as HTMLElement).dataset.observer === 'ignore')) {
     return
   }
-  messageListEl.value?.scrollTo({
-    top: messageListEl.value.scrollHeight,
-    behavior: isScrollSmooth ? 'smooth' : 'auto'
-  })
-  isScrollSmooth = false
-}, 200), { childList: true, subtree: true })
+  if (!isUserScrolling.value) {
+    scrollToBottom('auto')
+  }
+}, 250, true), { childList: true, subtree: true })
 
 async function loadChatHistory(sessionId?: number) {
   if (typeof sessionId === 'number' && sessionId > 0) {
     const res = await clientDB.chatHistories.where('sessionId').equals(sessionId).sortBy('id')
-    return res.slice(-limitHistorySize).map(el => {
+    return res.slice(-limitHistorySize.value).map(el => {
       return {
         id: el.id,
         content: el.message,
         role: el.role,
-        timestamp: el.timestamp,
-        type: el.canceled ? 'canceled' : undefined,
+        model: el.model,
+        startTime: el.startTime || 0,
+        endTime: el.endTime || 0,
+        type: el.canceled ? 'canceled' : (el.failed ? 'error' : undefined),
         relevantDocs: el.relevantDocs
       } as const
     })
@@ -85,142 +97,91 @@ async function loadChatHistory(sessionId?: number) {
   return []
 }
 
-const processRelevantDocuments = async (chunk: ResponseRelevantDocument) => {
-  if (chunk.type !== 'relevant_documents') return
-  const lastMessage = messages.value[messages.value.length - 1]
-  if (lastMessage?.role === 'assistant' && chunk.relevant_documents) {
-    lastMessage.relevantDocs = chunk.relevant_documents
-    await clientDB.chatHistories
-      .where('id')
-      .equals(lastMessage.id!)
-      .modify({
-        relevantDocs: chunk.relevant_documents.map(el => {
-          const pageContent = el.pageContent.slice(0, 100) + (el.pageContent.length > 0 ? '...' : '') // Avoid saving large-sized content
-          return { ...el, pageContent }
-        })
-      })
-    emits('message', lastMessage)
-  }
-}
-
-const fetchStream = async (url: string, options: RequestInit) => {
-  const response = await fetch(url, options)
-
-  if (response.body) {
-    messages.value = messages.value.filter((message) => message.type !== 'loading')
-    const reader = response.body.getReader()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      const chunk = new TextDecoder().decode(value)
-      for (const line of chunk.split('\n\n')) {
-        if (!line) continue
-
-        console.log('line: ', line)
-        const chatMessage = JSON.parse(line) as { message: Message } | ResponseRelevantDocument
-
-        if ('type' in chatMessage) {
-          await processRelevantDocuments(chatMessage)
-        } else {
-          const content = chatMessage?.message?.content
-          if (content) {
-            const lastItem = messages.value[messages.value.length - 1]
-            if (messages.value.length > 0 && lastItem.role === 'assistant') {
-              lastItem.content += content
-              if (lastItem.id && props.sessionId) {
-                await clientDB.chatHistories
-                  .where('id')
-                  .equals(lastItem.id)
-                  .modify({ message: lastItem.content })
-              }
-            } else {
-              const timestamp = Date.now()
-              const id = await saveMessage({
-                message: content,
-                model: model.value || '',
-                role: 'assistant',
-                timestamp,
-                canceled: false
-              })
-              const itemData = { id, role: 'assistant', content, timestamp } as const
-              if (messages.value.length >= limitHistorySize) {
-                messages.value = [...messages.value, itemData].slice(-limitHistorySize)
-              } else {
-                messages.value.push(itemData)
-              }
-            }
-            emits('message', lastItem)
-          }
-        }
-      }
-    }
-  } else {
-    console.log("The browser doesn't support streaming responses.")
-  }
-}
-
 const onSend = async (data: ChatBoxFormData) => {
   const input = data.content.trim()
-  if (sending.value || !input || !model.value) {
+  if (sendingCount.value > 0 || !input || !models.value) {
     return
   }
 
-  isScrollSmooth = true
-
   const timestamp = Date.now()
-  sending.value = true
+  sendingCount.value = models.value.length
   chatInputBoxRef.value?.reset()
 
-  const instructionMessage = instructionInfo.value
-    ? { role: "system", content: instructionInfo.value.instruction, timestamp }
+  const instructionMessage: Array<Pick<ChatMessage, 'role' | 'content'>> = instructionInfo.value
+    ? [{ role: "system", content: instructionInfo.value.instruction }]
     : []
 
   const id = await saveMessage({
     message: input,
-    model: model.value || '',
+    model: models.value.join(','),
     role: 'user',
-    timestamp,
+    startTime: timestamp,
+    endTime: timestamp,
     canceled: false,
+    failed: false,
     instructionId: instructionInfo.value?.id,
     knowledgeBaseId: knowledgeBaseInfo.value?.id
   })
 
-  const userMessage = { role: "user", id, content: input, timestamp } as const
+  const userMessage = { role: "user", id, content: input, startTime: timestamp, endTime: timestamp, model: models.value.join(',') || '' } as const
   emits('message', userMessage)
+  messages.value.push(userMessage)
 
-  const body = JSON.stringify({
-    knowledgebaseId: knowledgeBaseInfo.value?.id,
-    model: model.value,
-    family: modelFamily.value,
-    messages: [
-      instructionMessage,
-      messages.value.slice(messages.value.length - sessionInfo.value!.attachedMessagesCount),
-      omit(userMessage, ['id'])
-    ].flat(),
-    stream: true,
+  nextTick(() => scrollToBottom('smooth'))
+
+  models.value.forEach(m => {
+    const model = chatModels.value.find(e => e.value === m)
+    if (model) {
+      const id = Math.random()
+      const chatMessages = [
+        instructionMessage,
+        messages.value.filter(m => {
+          if (m.type === 'error' || m.type === 'canceled')
+            return false
+          return m.role === 'user' || (m.role === 'assistant' && (m.model === model.value || (model.value === `${(m as any).family}/${m.model}` /* incompatible old data */)))
+        }).slice(-(sessionInfo.value?.attachedMessagesCount || 1)),
+      ].flat()
+      messages.value.push({ id, role: "assistant", content: "", type: 'loading', startTime: timestamp, endTime: timestamp, model: model.value })
+
+      sendMessage({
+        type: 'request',
+        uid: id,
+        headers: getKeysHeader(),
+        data: {
+          knowledgebaseId: knowledgeBaseInfo.value?.id,
+          model: model.value,
+          messages: chatMessages,
+          stream: true,
+          sessionId: sessionInfo.value!.id!,
+          timestamp,
+        },
+      })
+    }
   })
-
-  messages.value.push(
-    userMessage,
-    { role: "assistant", content: "", type: 'loading', timestamp }
-  )
-
-  const controller = new AbortController()
-  abortHandler = () => controller.abort()
-  await fetchStream('/api/models/chat', {
-    method: 'POST',
-    body: body,
-    headers: {
-      ...fetchHeadersOllama.value,
-      ...fetchHeadersThirdApi.value,
-      'Content-Type': 'application/json',
-    },
-    signal: controller.signal,
-  })
-
-  sending.value = false
 }
+
+onReceivedMessage(data => {
+  if (data.sessionId !== sessionInfo.value!.id) return
+
+  switch (data.type) {
+    case 'error':
+      updateMessage(data, { id: data.id, content: data.message, type: 'error' })
+      break
+    case 'message':
+      if (sendingCount.value === 0) sendingCount.value += 1
+      updateMessage(data, { type: undefined, ...data.data })
+      break
+    case 'relevant_documents':
+      updateMessage(data, { type: undefined, ...data.data })
+      break
+    case 'complete':
+      sendingCount.value -= 1
+      break
+    case 'abort':
+      updateMessage(data, { type: 'canceled' })
+      break
+  }
+})
 
 onMounted(async () => {
   await Promise.all([loadOllamaInstructions(), loadKnowledgeBases()])
@@ -231,53 +192,53 @@ onMounted(async () => {
   initData(props.sessionId)
 })
 
-async function onAbortChat() {
-  abortHandler?.()
-  if (messages.value.length > 0) {
-    const lastOne = messages.value[messages.value.length - 1]
-    if (lastOne.type === 'loading') {
-      messages.value.pop()
-    } else if (lastOne.role === 'assistant') {
-      lastOne.type = 'canceled'
-      await clientDB.chatHistories
-        .where('id')
-        .equals(lastOne.id!)
-        .modify({ canceled: true })
-    }
+function updateMessage(data: WorkerSendMessage, newData: Partial<ChatMessage>) {
+  const index = 'id' in data ? messages.value.findIndex(el => el.id === data.uid || el.id === data.id) : -1
+  if (index > -1) {
+    messages.value.splice(index, 1, { ...messages.value[index], ...newData })
+  } else {
+    messages.value.push(newData as ChatMessage)
   }
-  sending.value = false
+}
+
+async function onAbortChat() {
+  sendMessage({ type: 'abort', sessionId: sessionInfo.value!.id! })
+  sendingCount.value = 0
 }
 
 function onOpenSettings() {
   modal.open(ChatSettings, {
     sessionId: props.sessionId!,
-    onClose: () => modal.close(),
+    onClose: () => modal.reset(),
     onUpdated: data => {
       const updatedSessionInfo: Partial<ChatSession> = {
         title: data.title,
         attachedMessagesCount: data.attachedMessagesCount,
         knowledgeBaseId: data.knowledgeBaseInfo?.id,
         instructionId: data.instructionInfo?.id,
-        model: data.modelInfo.value,
-        modelFamily: data.modelInfo.family
       }
       Object.assign(sessionInfo.value!, updatedSessionInfo)
 
-      model.value = data.modelInfo.value
-      modelFamily.value = data.modelInfo.family || ''
       knowledgeBaseInfo.value = data.knowledgeBaseInfo
       instructionInfo.value = data.instructionInfo
 
       emits('changeSettings', updatedSessionInfo)
+    },
+    onClear: () => {
+      messages.value = []
     }
   })
 }
 
-async function onResend(data: Message) {
+async function onModelsChange(models: string[]) {
+  await clientDB.chatSessions.update(props.sessionId!, { models })
+}
+
+async function onResend(data: ChatMessage) {
   onSend({ content: data.content })
 }
 
-async function onRemove(data: Message) {
+async function onRemove(data: ChatMessage) {
   await clientDB.chatHistories.where('id').equals(data.id!).delete()
   messages.value = messages.value.filter(el => el.id !== data.id)
   emits('message', null)
@@ -290,9 +251,20 @@ async function initData(sessionId?: number) {
   sessionInfo.value = result
   knowledgeBaseInfo.value = knowledgeBases.find(el => el.id === result?.knowledgeBaseId)
   instructionInfo.value = instructions.find(el => el.id === result?.instructionId)
-  model.value = result?.model || ''
-  modelFamily.value = result?.modelFamily || ''
+  if (result?.models) {
+    models.value = result.models
+  }
+  // incompatible old data
+  else if (result?.model) {
+    models.value = [`${result.modelFamily}/${result.model}`]
+  }
+
   messages.value = await loadChatHistory(sessionId)
+
+  nextTick(() => {
+    scrollToBottom('auto')
+    isFirstLoad.value = false
+  })
 }
 
 async function saveMessage(data: Omit<ChatHistory, 'sessionId'>) {
@@ -303,70 +275,38 @@ async function saveMessage(data: Omit<ChatHistory, 'sessionId'>) {
 </script>
 
 <template>
-  <div class="flex flex-col box-border dark:text-gray-300 -mx-4">
+  <div class="flex flex-col box-border dark:text-gray-300 md:-mx-4">
     <div class="px-4 border-b border-gray-200 dark:border-gray-700 box-border h-[57px] flex items-center">
+      <slot name="left-menu-btn"></slot>
       <ChatConfigInfo v-if="instructionInfo" icon="i-iconoir-terminal"
                       :title="instructionInfo.name"
-                      :description="instructionInfo.instruction" />
+                      :description="instructionInfo.instruction"
+                      class="hidden md:block" />
       <ChatConfigInfo v-if="knowledgeBaseInfo" icon="i-heroicons-book-open"
                       :title="knowledgeBaseInfo.name"
-                      class="mx-2" />
+                      class="mx-2 hidden md:block" />
       <div class="mx-auto px-4 text-center">
-        <h2 class="line-clamp-1">{{ sessionInfo?.title || 'Untitled' }}</h2>
+        <h2 class="line-clamp-1">{{ sessionInfo?.title || t('chat.untitled') }}</h2>
         <div class="text-xs text-muted line-clamp-1">{{ instructionInfo?.name }}</div>
       </div>
-      <UTooltip v-if="sessionId" text="Modify the current session configuration">
+      <UTooltip v-if="sessionId" :text="t('chat.modifyTips')">
         <UButton icon="i-iconoir-edit-pencil" color="gray" @click="onOpenSettings" />
       </UTooltip>
     </div>
     <div ref="messageListEl" class="relative flex-1 overflow-x-hidden overflow-y-auto px-4">
-      <div v-for="( message, index ) in visibleMessages " :key="index"
-           class="flex flex-col my-2"
-           :class="{ 'items-end': message.role === 'user' }">
-        <div class="text-gray-500 dark:text-gray-400 p-1">{{ message.role }}</div>
-        <div class="leading-6 text-sm flex items-center max-w-full message-content"
-             :class="{ 'text-gray-400 dark:text-gray-500': message.type === 'canceled', 'flex-row-reverse': message.role === 'user' }">
-          <div class="border border-primary/20 rounded-lg p-3 max-w-[calc(100%-2rem)] box-border"
-               :class="`${message.role == 'assistant' ? 'bg-gray-50 dark:bg-gray-800' : 'bg-primary-50 dark:bg-primary-400/60'}`">
-            <div v-if="message.type === 'loading'"
-                 class="text-xl text-primary animate-spin i-heroicons-arrow-path-solid">
-            </div>
-            <template v-else>
-              <pre v-if="message.role === 'user'" v-html="message.content" class="whitespace-break-spaces" />
-              <div v-else>
-                <div v-html="markdown.render(message.content)" class="md-body" />
-                <Sources :relevant_documents="message?.relevantDocs || []" />
-              </div>
-            </template>
-          </div>
-          <ChatMessageActionMore :message="message"
-                                 :disabled="sending"
-                                 @resend="onResend(message)"
-                                 @remove="onRemove(message)">
-            <UButton :class="{ invisible: sending }" icon="i-material-symbols-more-vert" color="gray"
-                     :variant="'link'"
-                     class="action-more">
-            </UButton>
-          </ChatMessageActionMore>
-        </div>
-      </div>
+      <ChatMessageItem v-for="message in visibleMessages" :key="message.id"
+                       :message :sending="sendingCount > 0" :show-toggle-button="models.length > 1"
+                       class="my-2" @resend="onResend" @remove="onRemove" />
     </div>
     <div class="shrink-0 pt-4 px-4 border-t border-gray-200 dark:border-gray-800">
       <ChatInputBox ref="chatInputBoxRef"
-                    :disabled="!model"
-                    :loading="sending"
-                    @submit="onSend"
-                    @stop="onAbortChat">
+                    :disabled="models.length === 0" :loading="sendingCount > 0"
+                    @submit="onSend" @stop="onAbortChat">
         <div class="text-muted flex">
-          <UTooltip v-if="sessionInfo?.model" text="Current Model" :popper="{ placement: 'top-start' }">
-            <div class="flex items-center mr-4 cursor-pointer hover:text-primary-400" @click="onOpenSettings">
-              <UIcon name="i-heroicons-rectangle-stack" class="mr-1"></UIcon>
-              <span class="text-sm">{{ sessionInfo?.modelFamily }}</span>
-              <span class="text-muted mx-1">/</span>
-              <span class="text-sm">{{ sessionInfo?.model }}</span>
-            </div>
-          </UTooltip>
-          <UTooltip text="Attached Message Count" :popper="{ placement: 'top-start' }">
+          <div class="mr-4">
+            <ModelsMultiSelectMenu v-model="models" @change="onModelsChange" />
+          </div>
+          <UTooltip :text="t('chat.attachedMessagesCount')" :popper="{ placement: 'top-start' }">
             <div class="flex items-center cursor-pointer hover:text-primary-400" @click="onOpenSettings">
               <UIcon name="i-material-symbols-history" class="mr-1"></UIcon>
               <span class="text-sm">{{ sessionInfo?.attachedMessagesCount }}</span>
@@ -377,21 +317,3 @@ async function saveMessage(data: Omit<ChatHistory, 'sessionId'>) {
     </div>
   </div>
 </template>
-
-<style scoped lang="scss">
-.message-content {
-  .action-more {
-    transform-origin: center center;
-    transition: all 0.3s;
-    transform: scale(0);
-    opacity: 0;
-  }
-
-  &:hover {
-    .action-more {
-      transform: scale(1);
-      opacity: 1;
-    }
-  }
-}
-</style>

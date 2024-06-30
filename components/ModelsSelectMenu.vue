@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { type ModelInfo } from '~/utils/settings'
+import type { ModelInfo } from '~/composables/useModels'
 
 const props = withDefaults(defineProps<{
   autoDefault?: boolean,
@@ -11,8 +11,12 @@ const props = withDefaults(defineProps<{
 type ModelName = string
 type ModelFamilyName = string
 
+const { t } = useI18n()
+
 const value = defineModel<[ModelName, ModelFamilyName]>({ default: [] })
 const currentModel = defineModel<ModelInfo>('modelInfo')
+
+const { loadModels, chatModels } = useModels({ immediate: false })
 
 const selectValue = computed({
   get() {
@@ -23,20 +27,20 @@ const selectValue = computed({
   }
 })
 
-const models = await loadModels()
+await loadModels()
 
 watch(value, () => {
   currentModel.value = getModelItem()
 }, { immediate: true })
 
 onMounted(() => {
-  if (props.autoDefault && [...value.value].length === 0 && models.length > 0) {
-    value.value = [models[0].value, models[0].family || '']
+  if (props.autoDefault && [...value.value].length === 0 && chatModels.value.length > 0) {
+    value.value = [chatModels.value[0].value, chatModels.value[0].family || '']
   }
 })
 
 function getModelItem() {
-  return models.find(el => {
+  return chatModels.value.find(el => {
     return el.value === value.value?.[0] && (value.value[1] === '' || value.value[1] === el.family)
   })
 }
@@ -45,9 +49,9 @@ function getModelItem() {
 <template>
   <ClientOnly>
     <USelectMenu v-model="selectValue"
-                 :options="models"
+                 :options="chatModels"
                  :size
-                 placeholder="Select a model">
+                 :placeholder="t('global.selectModel')">
       <template #label>
         <span>{{ currentModel?.family }}</span>
         <span class="text-muted">/</span>

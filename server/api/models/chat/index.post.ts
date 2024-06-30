@@ -2,12 +2,15 @@ import { Readable } from 'stream'
 import { formatDocumentsAsString } from "langchain/util/document"
 import { PromptTemplate } from "@langchain/core/prompts"
 import { RunnableSequence } from "@langchain/core/runnables"
-import { CohereRerank } from "@langchain/cohere"
+// import { CohereRerank } from "@langchain/cohere"
+import { CohereRerank } from "@/server/rerank/cohere"
 import { setEventStreamResponse } from '@/server/utils'
 import { BaseRetriever } from "@langchain/core/retrievers"
 import prisma from "@/server/utils/prisma"
 import { createChatModel, createEmbeddings } from '@/server/utils/models'
 import { createRetriever } from '@/server/retriever'
+import { AIMessage, BaseMessage, BaseMessageLike, HumanMessage } from '@langchain/core/messages'
+import { resolveCoreference } from '~/server/coref'
 
 interface RequestBody {
   knowledgebaseId: number
@@ -43,6 +46,22 @@ Answer:
 const serializeMessages = (messages: RequestBody['messages']): string =>
   messages.map((message) => `${message.role}: ${message.content}`).join("\n")
 
+const transformMessages = (messages: RequestBody['messages']): BaseMessageLike[] =>
+  messages.map((message) => [message.role, message.content])
+
+const normalizeMessages = (messages: RequestBody['messages']): BaseMessage[] => {
+  const normalizedMessages = []
+  for (const message of messages) {
+    if (message.role === "user") {
+      normalizedMessages.push(new HumanMessage(message.content))
+    } else if (message.role === "assistant") {
+      normalizedMessages.push(new AIMessage(message.content))
+    }
+  }
+
+  return normalizedMessages
+}
+
 export default defineEventHandler(async (event) => {
   const { knowledgebaseId, model, family, messages, stream } = await readBody<RequestBody>(event)
 
@@ -66,18 +85,29 @@ export default defineEventHandler(async (event) => {
     const query = messages[messages.length - 1].content
     console.log("User query: ", query)
 
-    const relevant_docs = await retriever.getRelevantDocuments(query)
+    const reformulatedResult = await resolveCoreference(
+      query,
+      normalizeMessages(messages),
+      process.env.OPENAI_API_KEY
+    )
+    const reformulatedQuery = reformulatedResult.output || query
+    console.log("Reformulated query: ", reformulatedQuery)
+
+    const relevant_docs = await retriever.getRelevantDocuments(reformulatedQuery)
     console.log("Relevant documents: ", relevant_docs)
 
     let rerankedDocuments = relevant_docs
 
-    if (process.env.COHERE_API_KEY) {
-      const cohereRerank = new CohereRerank({
+    if ((process.env.COHERE_API_KEY || process.env.COHERE_BASE_URL) && process.env.COHERE_MODEL) {
+      const options = {
         apiKey: process.env.COHERE_API_KEY,
-        model: "rerank-multilingual-v2.0",
+        baseUrl: process.env.COHERE_BASE_URL,
+        model: process.env.COHERE_MODEL,
         topN: 4
-      })
-      rerankedDocuments = await cohereRerank.compressDocuments(relevant_docs, query)
+      }
+      console.log("Cohere Rerank Options: ", options)
+      const cohereRerank = new CohereRerank(options)
+      rerankedDocuments = await cohereRerank.compressDocuments(relevant_docs, reformulatedQuery)
       console.log("Cohere reranked documents: ", rerankedDocuments)
     }
 
@@ -125,7 +155,7 @@ export default defineEventHandler(async (event) => {
               content: chunk?.content
             }
           }
-          yield `${JSON.stringify(message)}\n\n`
+          yield `${JSON.stringify(message)} \n\n`
         }
       }
 
@@ -133,11 +163,23 @@ export default defineEventHandler(async (event) => {
         type: "relevant_documents",
         relevant_documents: rerankedDocuments
       }
-      yield `${JSON.stringify(docsChunk)}\n\n`
+      yield `${JSON.stringify(docsChunk)} \n\n`
     })())
     return sendStream(event, readableStream)
   } else {
     const llm = createChatModel(model, family, event)
+
+    if (!stream) {
+      const response = await llm.invoke(transformMessages(messages))
+
+      return {
+        message: {
+          role: 'assistant',
+          content: response?.content
+        }
+      }
+    }
+
     const response = await llm?.stream(messages.map((message: RequestBody['messages'][number]) => {
       return [message.role, message.content]
     }))
@@ -150,7 +192,7 @@ export default defineEventHandler(async (event) => {
             content: chunk?.content
           }
         }
-        yield `${JSON.stringify(message)}\n\n`
+        yield `${JSON.stringify(message)} \n\n`
       }
     })())
 

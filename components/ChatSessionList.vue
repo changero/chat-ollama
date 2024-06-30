@@ -1,15 +1,17 @@
 <script lang="ts" setup>
 import { useStorage } from '@vueuse/core'
-
-interface ChatSessionInfo extends ChatSession {
-  count: number
-}
+import { USlideover } from '#components'
 
 const emits = defineEmits<{
   select: [sessionId: number]
+  closePanel: []
 }>()
 
-const sessionList = ref<ChatSessionInfo[]>([])
+const { t } = useI18n()
+const createChatSession = useCreateChatSession()
+const { isMobile } = useMediaBreakpoints()
+
+const sessionList = ref<ChatSession[]>([])
 const currentSessionId = useStorage<number>('currentSessionId', 0)
 const confirm = useDialog('confirm')
 
@@ -24,7 +26,7 @@ onMounted(async () => {
   }
 })
 
-defineExpose({ updateMessageCount, updateSessionInfo, createChat: onNewChat })
+defineExpose({ updateSessionInfo, createChat: onNewChat })
 
 async function onNewChat() {
   const data = await createChatSession()
@@ -37,9 +39,15 @@ function onSelectChat(sessionId: number) {
   emits('select', sessionId)
 }
 
+async function onTopChat(item: ChatSession, direction: string) {
+  // 设置clientDB中 chatSessions 的isTop字段为true
+  clientDB.chatSessions.update(item.id!, { isTop: direction == 'up' ? Date.now() : 0 })
+  sessionList.value = await getSessionList()
+}
+
 function onDeleteChat(data: ChatSession) {
-  confirm(`Are you sure deleting Chat <b class="text-primary">${data.title}</b> ?`, {
-    title: 'Delete Chat',
+  confirm(t("chat.deleteChatConfirm", [data.title || `${t("chat.newChat")} ${data.id}`]), {
+    title: t('chat.deleteChat'),
     dangerouslyUseHTMLString: true,
   })
     .then(async () => {
@@ -61,20 +69,24 @@ function onDeleteChat(data: ChatSession) {
 }
 
 async function getSessionList() {
-  const list: ChatSessionInfo[] = []
+  const list: ChatSession[] = []
   const result = await clientDB.chatSessions.orderBy('updateTime').reverse().toArray()
 
   for (const item of result) {
-    const count = await clientDB.chatHistories.where('sessionId').equals(item.id!).count()
-    list.push({ ...item, count })
+    list.push({ ...item, isTop: item.isTop || 0 })
   }
 
-  return list
+  return sortSessionList(list)
 }
 
-async function updateMessageCount(offset: number) {
-  const currentSession = sessionList.value.find(el => el.id === currentSessionId.value)!
-  currentSession.count = currentSession.count + offset
+function sortSessionList(data: ChatSession[]) {
+  const pinTopList: ChatSession[] = []
+  const list: ChatSession[] = []
+
+  data.forEach(el => el.isTop > 0 ? pinTopList.push(el) : list.push(el))
+  pinTopList.sort((a, b) => b.isTop - a.isTop)
+  list.sort((a, b) => b.updateTime - a.updateTime)
+  return [...pinTopList, ...list]
 }
 
 async function updateSessionInfo(data: Partial<Omit<ChatSession, 'id' | 'createTime'> & { forceUpdateTitle: boolean }>) {
@@ -89,57 +101,61 @@ async function updateSessionInfo(data: Partial<Omit<ChatSession, 'id' | 'createT
 
   if (Object.keys(savedData).length > 0) {
     Object.assign(currentSession, savedData)
-    sessionList.value.sort((a, b) => b.updateTime - a.updateTime)
+    sessionList.value = sortSessionList(sessionList.value)
     await clientDB.chatSessions.where('id').equals(currentSessionId.value).modify(savedData)
   }
 }
 </script>
 
 <template>
-  <div class="h-full box-border bg-gray-100 dark:bg-gray-900 border-r dark:border-gray-800">
+  <Component :is="isMobile ? USlideover : 'div'"
+             :class="isMobile ? 'w-[80vw] max-w-[400px] h-full' : 'border-r dark:border-gray-800'"
+             class="h-full box-border">
     <div class="p-3 border-b border-primary-400/30 flex items-center">
-      <h3 class="text-primary-600 dark:text-primary-300 mr-auto">All Chats ({{ sessionList.length }})</h3>
-      <UTooltip text="New Chat" :popper="{ placement: 'top' }">
+      <h3 class="text-primary-600 dark:text-primary-300 mr-auto">{{ t("chat.allChats") }} ({{ sessionList.length }})</h3>
+      <UTooltip :text="t('chat.newChat')" :popper="{ placement: 'top' }">
         <UButton icon="i-material-symbols-add" color="primary" square @click="onNewChat"></UButton>
       </UTooltip>
+      <UButton icon="i-material-symbols-close-rounded" color="gray" class="md:hidden ml-4" @click="emits('closePanel')"></UButton>
     </div>
     <TransitionGroup tag="div" name="list" class="h-[calc(100%-57px)] overflow-auto">
       <div v-for="item in sessionList" :key="item.id"
-           class="session-item dark:text-gray-300 hover:bg-primary-100 dark:hover:bg-primary-700/30 p-3 cursor-pointer border-b border-gray-200 dark:border-gray-800 flex items-center"
-           :class="{ 'bg-primary-100 dark:bg-primary-700/30 activated': currentSessionId === item.id }"
+           class="session-item relative box-border p-2 cursor-pointer dark:text-gray-300 border-b border-b-gray-100 dark:border-b-gray-100/5 border-l-2"
+           :class="[
+            item.isTop ? 'bg-primary-300/10 dark:bg-primary-800/10' : 'hover:bg-gray-50 dark:hover:bg-gray-700/30',
+            currentSessionId === item.id ? 'border-l-pink-700/80 dark:border-l-pink-400/80' : 'border-l-transparent'
+          ]"
            @click="onSelectChat(item.id!)">
-        <div class="grow">
-          <div class="line-clamp-1">{{ item.title || `New Chat ${item.id}` }}</div>
-          <div class="text-sm text-muted line-clamp-1">{{ item.count }} messages</div>
+        <div class="w-full flex items-center text-sm h-[32px]">
+          <div class="line-clamp-1 grow"
+               :class="currentSessionId === item.id ? 'text-pink-700  dark:text-pink-400 font-bold' : 'opacity-80'">
+            {{ item.title || `${t("chat.newChat")} ${item.id}` }}
+          </div>
+          <ChatSessionListActionMore :data="item"
+                                     class="action-more"
+                                     @pin="onTopChat(item, 'up')"
+                                     @unpin="onTopChat(item, 'down')"
+                                     @delete="onDeleteChat(item)" />
         </div>
-        <UButton icon="i-material-symbols-delete-outline" size="2xs" color="red" class="btn-delete"
-                 @click.stop="onDeleteChat(item)"></UButton>
       </div>
     </TransitionGroup>
-  </div>
+  </Component>
 </template>
 
 <style lang="scss" scoped>
 .session-item {
-  overflow: hidden;
 
-  &.activated {
-    border-left: 2px solid rgb(var(--color-primary-500));
-  }
-
-  .btn-delete {
-    transition: all 0.3s;
-    width: 0px;
-    transform-origin: right center;
-    transform: translateX(calc(100% + 0.75rem)) scale(0);
-    opacity: 0;
+  :deep() {
+    @media (pointer: fine) {
+      .action-more {
+        display: none;
+      }
+    }
   }
 
   &:hover {
-    .btn-delete {
-      width: auto;
-      transform: translateX(0) scale(1);
-      opacity: 1;
+    :deep() .action-more {
+      display: block;
     }
   }
 }
